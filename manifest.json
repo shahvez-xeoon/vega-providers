@@ -553,6 +553,12 @@
     "disabled": false,
     "moduleVersionHeader": true
   },
+  {    
+   "name": "CineStream",
+   "internalName": "CineStreamProvider",
+    "authors": ["Shahvez-Xeoon"],
+   "pluginUrl": "https://github.com/shahvez-xeoon/vega-providers/raw/refs/heads/main/CineStream.cs3"
+  },
   {
     "display_name": "LiveTG TV",
     "value": "liveTgTv",
