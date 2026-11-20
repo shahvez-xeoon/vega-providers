@@ -11,6 +11,42 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 const VEGA_DIST = path.join(__dirname, 'dist');
+const LOCAL_URLS_JSON = path.join(__dirname, 'urls.json');
+
+if (typeof global.fetch !== 'function') {
+  global.fetch = async (url, opts = {}) => {
+    const res = await axios({
+      url: String(url),
+      method: opts.method || 'GET',
+      headers: opts.headers || {},
+      data: opts.body,
+      timeout: 12000,
+      validateStatus: () => true,
+    });
+    return {
+      ok: res.status >= 200 && res.status < 300,
+      status: res.status,
+      statusText: res.statusText || '',
+      text: async () =>
+        typeof res.data === 'string' ? res.data : JSON.stringify(res.data),
+      json: async () =>
+        typeof res.data === 'string' ? JSON.parse(res.data) : res.data,
+    };
+  };
+}
+
+let cachedUrlsMap = null;
+function loadLocalUrls() {
+  if (cachedUrlsMap) return cachedUrlsMap;
+  try {
+    if (fs.existsSync(LOCAL_URLS_JSON)) {
+      cachedUrlsMap = JSON.parse(fs.readFileSync(LOCAL_URLS_JSON, 'utf8'));
+      return cachedUrlsMap;
+    }
+  } catch (_) {}
+  cachedUrlsMap = {};
+  return cachedUrlsMap;
+}
 
 const commonHeaders = {
   'User-Agent':
@@ -25,13 +61,15 @@ function makeProviderContext() {
     cheerio,
     commonHeaders,
     headers: commonHeaders,
+    urls: loadLocalUrls(),
     signal: new AbortController().signal,
   };
 }
 
 function loadProviders(mediaType) {
   if (!fs.existsSync(VEGA_DIST)) return [];
-  const dirs = fs.readdirSync(VEGA_DIST, { withFileTypes: true })
+  const dirs = fs
+    .readdirSync(VEGA_DIST, { withFileTypes: true })
     .filter((d) => d.isDirectory())
     .map((d) => d.name);
 
@@ -75,19 +113,25 @@ function loadProviders(mediaType) {
       const streamPath = path.join(dir, 'stream.js');
       const metaPath = path.join(dir, 'meta.js');
       if (!fs.existsSync(postsPath) || !fs.existsSync(streamPath)) return null;
-      return {
-        name,
-        postsMod: require(postsPath),
-        streamMod: require(streamPath),
-        metaMod: fs.existsSync(metaPath) ? require(metaPath) : null,
-      };
+      try {
+        return {
+          name,
+          postsMod: require(postsPath),
+          streamMod: require(streamPath),
+          metaMod: fs.existsSync(metaPath) ? require(metaPath) : null,
+        };
+      } catch (e) {
+        return { name, loadError: e.message };
+      }
     })
     .filter(Boolean);
 }
 
 app.get('/health', (req, res) => {
   const count = fs.existsSync(VEGA_DIST)
-    ? fs.readdirSync(VEGA_DIST, { withFileTypes: true }).filter((d) => d.isDirectory()).length
+    ? fs
+        .readdirSync(VEGA_DIST, { withFileTypes: true })
+        .filter((d) => d.isDirectory()).length
     : 0;
   res.json({ ok: true, providersAvailable: count });
 });
@@ -97,18 +141,28 @@ app.get('/resolve', async (req, res) => {
   const type = String(req.query.type || 'movie').trim().toLowerCase();
   const season = Number(req.query.season || 1) || 1;
   const episode = Number(req.query.episode || 1) || 1;
+  const debug = String(req.query.debug || '') === '1';
 
   if (!title) {
     return res.status(400).json({ error: 'title query parameter is required' });
   }
 
   const ctx = makeProviderContext();
-  const providers = loadProviders(type).slice(0, 8);
+  const providers = loadProviders(type).slice(0, 14);
   const collected = [];
+  const trace = [];
 
   for (const prov of providers) {
+    if (prov.loadError) {
+      trace.push({ provider: prov.name, step: 'load', error: prov.loadError });
+      continue;
+    }
     try {
-      if (typeof prov.postsMod.getSearchPosts !== 'function') continue;
+      if (typeof prov.postsMod?.getSearchPosts !== 'function') {
+        trace.push({ provider: prov.name, step: 'search', error: 'no getSearchPosts' });
+        continue;
+      }
+
       const posts = await Promise.race([
         prov.postsMod.getSearchPosts({
           searchQuery: title,
@@ -117,21 +171,34 @@ app.get('/resolve', async (req, res) => {
           providerContext: ctx,
         }),
         new Promise((_, reject) =>
-          setTimeout(() => reject(new Error('search timeout')), 9000)
+          setTimeout(() => reject(new Error('search timeout')), 10000)
         ),
       ]);
 
-      if (!Array.isArray(posts) || posts.length === 0) continue;
+      const postCount = Array.isArray(posts) ? posts.length : 0;
+      if (postCount === 0) {
+        trace.push({ provider: prov.name, step: 'search', posts: 0 });
+        continue;
+      }
+
       const topPost = posts[0];
       let targetUrl = topPost.link;
       let streamType = type === 'anime' ? 'anime' : 'movie';
 
-      if ((type === 'tv' || type === 'anime') && prov.metaMod && typeof prov.metaMod.getMeta === 'function') {
+      if (
+        (type === 'tv' || type === 'anime') &&
+        prov.metaMod &&
+        typeof prov.metaMod.getMeta === 'function'
+      ) {
         try {
           const meta = await Promise.race([
-            prov.metaMod.getMeta({ link: topPost.link, providerContext: ctx }),
+            prov.metaMod.getMeta({
+              link: topPost.link,
+              signal: ctx.signal,
+              providerContext: ctx,
+            }),
             new Promise((_, reject) =>
-              setTimeout(() => reject(new Error('meta timeout')), 8000)
+              setTimeout(() => reject(new Error('meta timeout')), 9000)
             ),
           ]);
           const links = meta?.linkList || meta?.episodes || [];
@@ -141,16 +208,21 @@ app.get('/resolve', async (req, res) => {
                 (ep) =>
                   Number(ep.season || 1) === season &&
                   Number(ep.episode || ep.number || 0) === episode
-              ) || links[episode - 1] || links[0];
+              ) ||
+              links[episode - 1] ||
+              links[0];
             if (matched && matched.link) {
               targetUrl = matched.link;
               streamType = 'series';
             }
           }
-        } catch (_) {}
+        } catch (e) {
+          trace.push({ provider: prov.name, step: 'meta', error: e.message });
+        }
       }
 
-      if (typeof prov.streamMod.getStream === 'function' && targetUrl) {
+      let foundInProv = 0;
+      if (typeof prov.streamMod?.getStream === 'function' && targetUrl) {
         const rawStreams = await Promise.race([
           prov.streamMod.getStream({
             url: targetUrl,
@@ -159,13 +231,14 @@ app.get('/resolve', async (req, res) => {
             providerContext: ctx,
           }),
           new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('stream timeout')), 12000)
+            setTimeout(() => reject(new Error('stream timeout')), 14000)
           ),
         ]);
 
         if (Array.isArray(rawStreams)) {
           for (const s of rawStreams) {
             if (s && s.link) {
+              foundInProv++;
               collected.push({
                 provider: prov.name,
                 server: s.server || prov.name,
@@ -180,18 +253,28 @@ app.get('/resolve', async (req, res) => {
         }
       }
 
+      trace.push({
+        provider: prov.name,
+        posts: postCount,
+        streams: foundInProv,
+      });
+
       if (collected.length >= 6) break;
-    } catch (_) {}
+    } catch (e) {
+      trace.push({ provider: prov.name, error: e.message });
+    }
   }
 
-  return res.json({
+  const payload = {
     title,
     type,
     season,
     episode,
     streamsFound: collected.length,
     streams: collected,
-  });
+  };
+  if (debug) payload.trace = trace;
+  return res.json(payload);
 });
 
 app.listen(PORT, () => {
