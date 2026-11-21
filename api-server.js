@@ -16,6 +16,8 @@ const commonHeaders = {
   'Accept-Language': 'en-US,en;q=0.9,hi;q=0.8',
 };
 
+const wait = (p, ms) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms))]);
+
 function makeCtx() {
   return {
     axios,
@@ -49,6 +51,48 @@ function normalizeStreams(raw, provName) {
     }));
 }
 
+async function getTargetLinks(dir, postLink, type, season, episode, ctx) {
+  const metaPath = path.join(dir, 'meta.js');
+  const epPath = path.join(dir, 'episodes.js');
+  if (!fs.existsSync(metaPath)) return [postLink];
+  const metaMod = require(metaPath);
+  if (typeof metaMod.getMeta !== 'function') return [postLink];
+
+  const meta = await wait(metaMod.getMeta({ link: postLink, providerContext: ctx }), 10000);
+  const list = Array.isArray(meta && meta.linkList) ? meta.linkList : [];
+  if (!list.length) return [postLink];
+
+  const links = [];
+  if (type !== 'movie') {
+    const sMatch = list.find((x) => new RegExp('S0?' + season + '\\b|Season\\s*0?' + season, 'i').test(x.title || '')) || list[0];
+    if (sMatch && sMatch.episodesLink && fs.existsSync(epPath)) {
+      const epMod = require(epPath);
+      if (typeof epMod.getEpisodes === 'function') {
+        const eps = await wait(epMod.getEpisodes({ url: sMatch.episodesLink, providerContext: ctx }), 10000);
+        if (Array.isArray(eps) && eps.length) {
+          const picked = eps[episode - 1] || eps[0];
+          if (picked && picked.link) links.push(picked.link);
+        }
+      }
+    }
+    if (!links.length && sMatch && Array.isArray(sMatch.directLinks)) {
+      const picked = sMatch.directLinks[episode - 1] || sMatch.directLinks[0];
+      if (picked && picked.link) links.push(picked.link);
+    }
+  } else {
+    for (const item of list) {
+      if (Array.isArray(item.directLinks)) {
+        for (const d of item.directLinks) {
+          if (d && d.link && links.length < 3) links.push(d.link);
+        }
+      }
+      if (item.episodesLink && links.length < 3) links.push(item.episodesLink);
+      if (links.length >= 3) break;
+    }
+  }
+  return links.length ? links : [postLink];
+}
+
 app.get('/health', (req, res) => {
   const count = fs.existsSync(VEGA_DIST)
     ? fs.readdirSync(VEGA_DIST, { withFileTypes: true }).filter((d) => d.isDirectory()).length
@@ -67,73 +111,50 @@ app.get('/resolve', async (req, res) => {
   const ctx = makeCtx();
   const collected = [];
   const trace = [];
+  const order = type === 'anime'
+    ? ['animesalt', 'animeworld', 'hiAnime', 'animesub']
+    : ['hdhub4u', '4khdhub', 'castle', 'moviesmod', 'vega', 'mod'];
 
-  // 1. Direct fast path: autoEmbed (uses tmdbId directly -> Cinejoy + Movy + Vidstuck)
-  if (tmdbId) {
+  for (const name of order) {
+    const dir = path.join(VEGA_DIST, name);
+    if (!fs.existsSync(path.join(dir, 'posts.js')) || !fs.existsSync(path.join(dir, 'stream.js'))) continue;
     try {
-      const ae = require(path.join(VEGA_DIST, 'autoEmbed', 'stream.js'));
-      const payload = JSON.stringify({
-        tmdbId,
-        title,
-        type: type === 'movie' ? 'movie' : 'tv',
-        season,
-        episode,
-      });
-      const raw = await Promise.race([
-        ae.getStream({
-          link: payload,
-          type: type === 'movie' ? 'movie' : 'series',
-          providerContext: ctx,
-          signal: ctx.signal,
-          isDownload: false,
-        }),
-        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 15000)),
-      ]);
-      const items = normalizeStreams(raw, 'autoEmbed');
-      collected.push(...items);
-      trace.push({ provider: 'autoEmbed', streams: items.length });
-    } catch (e) {
-      trace.push({ provider: 'autoEmbed', error: e.message });
-    }
-  }
-
-  // 2. Fallback: search-based Vega providers (for Hindi / Anime / extra servers)
-  if (collected.length < 3 && title) {
-    const order = type === 'anime'
-      ? ['animesalt', 'animeworld', 'hiAnime', 'animesub']
-      : ['castle', '4khdhub', 'cinemaLuxe', 'hdhub4u'];
-
-    for (const name of order) {
-      const dir = path.join(VEGA_DIST, name);
-      if (!fs.existsSync(path.join(dir, 'posts.js')) || !fs.existsSync(path.join(dir, 'stream.js'))) continue;
-      try {
-        const postsMod = require(path.join(dir, 'posts.js'));
-        const streamMod = require(path.join(dir, 'stream.js'));
-        const posts = await Promise.race([
-          postsMod.getSearchPosts({ searchQuery: title, page: 1, signal: ctx.signal, providerContext: ctx }),
-          new Promise((_, rej) => setTimeout(() => rej(new Error('search timeout')), 8000)),
-        ]);
-        if (!Array.isArray(posts) || !posts.length) {
-          trace.push({ provider: name, posts: 0 });
-          continue;
-        }
-        const raw = await Promise.race([
-          streamMod.getStream({
-            link: posts[0].link,
-            url: posts[0].link,
-            type: type === 'movie' ? 'movie' : 'series',
-            providerContext: ctx,
-            signal: ctx.signal,
-          }),
-          new Promise((_, rej) => setTimeout(() => rej(new Error('stream timeout')), 10000)),
-        ]);
-        const items = normalizeStreams(raw, name);
-        collected.push(...items);
-        trace.push({ provider: name, posts: posts.length, streams: items.length });
-        if (collected.length >= 6) break;
-      } catch (e) {
-        trace.push({ provider: name, error: e.message });
+      const postsMod = require(path.join(dir, 'posts.js'));
+      const streamMod = require(path.join(dir, 'stream.js'));
+      const posts = await wait(
+        postsMod.getSearchPosts({ searchQuery: title, page: 1, signal: ctx.signal, providerContext: ctx }),
+        9000
+      );
+      if (!Array.isArray(posts) || !posts.length) {
+        trace.push({ provider: name, posts: 0 });
+        continue;
       }
+      const targetLinks = await getTargetLinks(dir, posts[0].link, type, season, episode, ctx);
+      let found = 0;
+      for (const tLink of targetLinks) {
+        try {
+          const raw = await wait(
+            streamMod.getStream({
+              link: tLink,
+              url: tLink,
+              type: type === 'movie' ? 'movie' : 'series',
+              providerContext: ctx,
+              signal: ctx.signal,
+            }),
+            12000
+          );
+          const items = normalizeStreams(raw, name);
+          collected.push(...items);
+          found += items.length;
+          if (collected.length >= 4) break;
+        } catch (se) {
+          trace.push({ provider: name, link: tLink.slice(0, 60), streamErr: se.message });
+        }
+      }
+      trace.push({ provider: name, posts: posts.length, metaLinks: targetLinks.length, streams: found });
+      if (collected.length >= 4) break;
+    } catch (e) {
+      trace.push({ provider: name, error: e.message });
     }
   }
 
